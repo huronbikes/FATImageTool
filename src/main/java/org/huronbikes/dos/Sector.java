@@ -58,12 +58,6 @@ public class Sector {
     }
 
 
-    protected byte[] readAll(ByteBuffer buffer) {
-        var targetBuffer = ByteBuffer.allocate(buffer.remaining());
-        targetBuffer.put(0, buffer, buffer.position(), buffer.remaining());
-        return targetBuffer.array();
-    }
-
     public void textOutput() {
         var line = new byte[64];
         for(int offset = 0; offset < data.length; offset+= line.length) {

@@ -3,10 +3,12 @@ package org.huronbikes.dos.FAT;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.Setter;
+import org.huronbikes.dos.ByteUtils;
 import org.huronbikes.dos.Directory.*;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.Array;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.StandardOpenOption;
@@ -56,9 +58,41 @@ public class FAT16 implements FAT {
     private final AtomicReference<ClusterList> freeSpace = new AtomicReference<>();
     private final File imageFile;
     private final int endOfRecordMarker;
+    private final int mediaTypeMarker;
     private final int rootDirectoryEntries;
     private final long rootDirectoryOffset;
     private final long dataOffset;
+
+    public FAT16(
+            File imageFile,
+            FileChannel imageChannel,
+            int bytesPerFat,
+            int fatCopies,
+            long fatOffset,
+            int bytesPerCluster,
+            int clusterCount,
+            int rootDirectoryEntries,
+            long rootDirectoryOffset,
+            long dataOffset
+    ) throws IOException {
+        this.imageFile = imageFile;
+        this.bytesPerFat = bytesPerFat;
+        this.fatCopies = fatCopies;
+        this.fatOffset = fatOffset;
+        this.bytesPerCluster = bytesPerCluster;
+        this.clusterCount = clusterCount;
+        this.rootDirectoryEntries = rootDirectoryEntries;
+        this.rootDirectoryOffset = rootDirectoryOffset;
+        this.dataOffset = dataOffset;
+        imageChannel.position(fatOffset);
+        data = ByteBuffer.allocate(bytesPerFat);
+        imageChannel.read(data);
+
+        freeSpace.set(getUnallocatedClusters());
+        endOfRecordMarker = getEndOfRecordMarker();
+        mediaTypeMarker = getMediaTypeMarker();
+        data.position(0);
+    }
 
     public FAT16(
             File imageFile,
@@ -70,6 +104,37 @@ public class FAT16 implements FAT {
             int rootDirectoryEntries,
             long rootDirectoryOffset,
             long dataOffset) throws IOException {
+        try (var imageChannel = FileChannel.open(imageFile.toPath())) {
+            this.imageFile = imageFile;
+            this.bytesPerFat = bytesPerFat;
+            this.fatCopies = fatCopies;
+            this.fatOffset = fatOffset;
+            this.bytesPerCluster = bytesPerCluster;
+            this.clusterCount = clusterCount;
+            this.rootDirectoryEntries = rootDirectoryEntries;
+            this.rootDirectoryOffset = rootDirectoryOffset;
+            this.dataOffset = dataOffset;
+            imageChannel.position(fatOffset);
+            data = ByteBuffer.allocate(bytesPerFat);
+            imageChannel.read(data);
+
+            freeSpace.set(getUnallocatedClusters());
+            endOfRecordMarker = getEndOfRecordMarker();
+            mediaTypeMarker = getMediaTypeMarker();
+            data.position(0);
+        }
+    }
+
+    public FAT16(
+            File imageFile,
+            int bytesPerFat,
+            int fatCopies,
+            long fatOffset,
+            int bytesPerCluster,
+            int clusterCount,
+            int rootDirectoryEntries,
+            int mediaTypeMarker,
+            int endOfRecordMarker) throws IOException {
         this.imageFile = imageFile;
         this.bytesPerFat = bytesPerFat;
         this.fatCopies = fatCopies;
@@ -77,16 +142,32 @@ public class FAT16 implements FAT {
         this.bytesPerCluster = bytesPerCluster;
         this.clusterCount = clusterCount;
         this.rootDirectoryEntries = rootDirectoryEntries;
-        this.rootDirectoryOffset = rootDirectoryOffset;
-        this.dataOffset = dataOffset;
-        try(var channel = FileChannel.open(imageFile.toPath())) {
-            channel.position(fatOffset);
-            data = ByteBuffer.allocate(bytesPerFat);
-            channel.read(data);
-        }
+        this.endOfRecordMarker = endOfRecordMarker;
+        this.rootDirectoryOffset = fatOffset + ((long) bytesPerFat * fatCopies);
+        this.dataOffset = rootDirectoryOffset + ((long) rootDirectoryEntries * DirectoryItemEntry.BYTES_PER_DIRECTORY_ENTRY);
+        this.mediaTypeMarker = mediaTypeMarker;
+        data = ByteBuffer.allocate(bytesPerFat);
+        initialize();
+
         freeSpace.set(getUnallocatedClusters());
-        endOfRecordMarker = getEndOfRecordMarker();
         data.position(0);
+    }
+
+    private void initialize() throws IOException {
+        try(var channel = openForWrite()) {
+            channel.position(fatOffset);
+            Arrays.fill(data.array(), (byte)0);
+            var mediaTypeAndEndOfRecord = new byte[4];
+            ByteUtils.writeWord(mediaTypeAndEndOfRecord, mediaTypeMarker, 0);
+            ByteUtils.writeWord(mediaTypeAndEndOfRecord, endOfRecordMarker, 2);
+            commit(channel);
+            channel.position(rootDirectoryOffset);
+            byte[] blankEntry = new byte[32];
+            Arrays.fill(blankEntry, (byte)0);
+            for(int i = 0; i < this.rootDirectoryEntries; i++) {
+                channel.write(ByteBuffer.wrap(blankEntry));
+            }
+        }
     }
 
     /**
@@ -143,9 +224,13 @@ public class FAT16 implements FAT {
 
     public void commit() throws IOException {
         try(var channel = openForWrite()) {
-            for (int i = 0; i < fatCopies; i++) {
-                commit(channel, fatOffset + ((long) bytesPerFat * i));
-            }
+            commit(channel);
+        }
+    }
+
+    private void commit(FileChannel channel) throws IOException {
+        for (int i = 0; i < fatCopies; i++) {
+            commit(channel, fatOffset + ((long) bytesPerFat * i));
         }
     }
 
@@ -156,9 +241,21 @@ public class FAT16 implements FAT {
             data.position((currentClusterNumber * BYTES_PER_ENTRY));
             byte low = (byte)(nextClusterNumber & 0xFF);
             byte high = (byte)((nextClusterNumber & 0xFF00) >> 8);
-            data.put(high);
-            data.put(low);
+            data.put(new byte[] { high, low });
         }
+    }
+
+    public void free(List<Integer> clusterNumbers) {
+        ClusterList freespaceHead;
+        for(var clusterNumber : clusterNumbers) {
+            data.position((clusterNumber * BYTES_PER_ENTRY));
+            data.putShort((short) 0);
+        }
+        ClusterList newFreespace;
+        do {
+            freespaceHead = freeSpace.get();
+            newFreespace = getUnallocatedClusters();
+        } while(!freeSpace.compareAndSet(freespaceHead, newFreespace));
     }
 
     private void commit(FileChannel imageFileChannel, long fatOffset) throws IOException {
@@ -197,6 +294,10 @@ public class FAT16 implements FAT {
 
     private int getEndOfRecordMarker() {
         return (int) parseLong(data, 2, 2);
+    }
+
+    private int getMediaTypeMarker() {
+        return (int) parseLong(data, 0, 2);
     }
 
     /**
@@ -260,7 +361,7 @@ public class FAT16 implements FAT {
     }
 
     private List<DirectoryItemEntry> getRootDirectoryEntries() throws IOException {
-        return DirectoryItemEntry.getDirectoryEntries(readRootDirectory().array(), 0);
+        return DirectoryItemEntry.fromBuffer(readRootDirectory(), 0).toList();
     }
 
     private ByteBuffer readRootDirectory() throws IOException {

@@ -8,6 +8,7 @@ import java.nio.ByteBuffer;
 import java.time.LocalDateTime;
 import java.util.Arrays;
 import java.util.List;
+import java.util.stream.Stream;
 
 @RequiredArgsConstructor
 public abstract class DirectoryBase implements Directory {
@@ -20,11 +21,11 @@ public abstract class DirectoryBase implements Directory {
     public abstract void addCluster(int newClusterNumber);
     public abstract String getVolumeLabel();
 
-    public abstract List<DirectoryItemEntry> getDirectoryEntries() throws IOException;
+    public abstract Stream<DirectoryItemEntry> getDirectoryEntries() throws IOException;
 
     @Override
     public List<DirectoryItemEntry> list() throws IOException {
-        return getDirectoryEntries();
+        return getDirectoryEntries().toList();
     }
 
     @Override
@@ -32,7 +33,10 @@ public abstract class DirectoryBase implements Directory {
 
     @Override
     public DirectoryBase getSubDirectory(String directory) throws IOException {
-        var result = list().stream().filter(e -> e.getAttributes().isDirectory()).findFirst();
+        var result = getDirectoryEntries()
+                .filter(e -> e.getName().equalsIgnoreCase(directory))
+                .filter(e -> e.getAttributes().isDirectory())
+                .findFirst();
         if( result.isPresent() ) {
             return getSubDirectory(result.get());
         } else {
@@ -49,28 +53,28 @@ public abstract class DirectoryBase implements Directory {
         fat.store(clusters);
         ByteBuffer content = ByteBuffer.allocate(fat.getBytesPerCluster());
         LocalDateTime now = LocalDateTime.now();
-        DirectoryItemEntry newEntry = new DirectoryItemEntry(
+        DirectoryItemEntry newEntry = DirectoryItemEntry.createNew(
                 directoryName,
                 DirectoryItemEntry.Attributes.builder().directory(true).build(),
                 now,
                 now,
-                0,
+                clusters.getFirst(),
                 0L);
 
-        DirectoryItemEntry current = new DirectoryItemEntry(
+        DirectoryItemEntry current = DirectoryItemEntry.createNew(
                 CURRENT_DIRECTORY_NAME,
                 DirectoryItemEntry.Attributes.builder().directory(true).build(),
                 now,
                 now,
-                0,
+                clusters.getFirst(),
                 0L);
 
-        DirectoryItemEntry parentEntry = new DirectoryItemEntry(
+        DirectoryItemEntry parentEntry = DirectoryItemEntry.createNew(
                 PARENT_DIRECTORY_NAME,
                 DirectoryItemEntry.Attributes.builder().directory(true).build(),
                 now,
                 now,
-                0,
+                getFirstClusterNumber(),
                 0L);
 
         Arrays.fill(content.array(), (byte)0);
@@ -92,4 +96,6 @@ public abstract class DirectoryBase implements Directory {
     }
 
     protected abstract void addDirectoryEntry(DirectoryItemEntry directoryItemEntry) throws IOException;
+    protected abstract void removeDirectoryEntry(DirectoryItemEntry directoryItemEntry) throws IOException;
+
 }

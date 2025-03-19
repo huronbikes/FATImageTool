@@ -68,4 +68,10 @@ public class ByteUtils {
         }
         return shortName;
     }
+
+    public static byte[] readAll(ByteBuffer buffer) {
+        var targetBuffer = ByteBuffer.allocate(buffer.remaining());
+        targetBuffer.put(0, buffer, buffer.position(), buffer.remaining());
+        return targetBuffer.array();
+    }
 }

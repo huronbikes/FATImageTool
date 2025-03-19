@@ -3,12 +3,15 @@ package org.huronbikes.dos.Directory;
 import lombok.*;
 import org.huronbikes.dos.ByteUtils;
 
+import java.nio.ByteBuffer;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Objects;
 import java.util.function.BiConsumer;
+import java.util.stream.Stream;
 
 @AllArgsConstructor
 public class DirectoryItemEntry {
@@ -36,8 +39,6 @@ public class DirectoryItemEntry {
         private boolean volumeId;
         private boolean directory;
         private boolean archive;
-        private boolean unnamed1;
-        private boolean unnamed2;
 
         public byte toByte() {
             boolean[] flags = new boolean[] {readOnly, hidden, system, volumeId, directory, archive};
@@ -58,8 +59,6 @@ public class DirectoryItemEntry {
                     .volumeId((attributeSet & 0x8) == 0x8)
                     .directory((attributeSet & 0x10) == 0x10)
                     .archive((attributeSet & 0x20) == 0x20)
-                    .unnamed1((attributeSet & 0x40) == 0x40)
-                    .unnamed2((attributeSet & 0x80) == 0x80)
                     .build();
         }
 
@@ -79,8 +78,6 @@ public class DirectoryItemEntry {
             setFlag.accept('V', volumeId);
             setFlag.accept('D', directory);
             setFlag.accept('A', archive);
-            setFlag.accept('1', unnamed1);
-            setFlag.accept('2', unnamed2);
             return builder.toString();
         }
     }
@@ -102,6 +99,8 @@ public class DirectoryItemEntry {
     private final int writeDate;
     @Getter
     private final long fileSize;
+    private final int entryCluster;
+    private final int entryOffset;
 
     public String getName() {
         if(attributes.isVolumeId()) {
@@ -134,7 +133,16 @@ public class DirectoryItemEntry {
         return new FileDateTime(fileLastAccessDate);
     }
 
-    public DirectoryItemEntry(
+    public static DirectoryItemEntry createNew(            String name,
+                                                           Attributes attributes,
+                                                           LocalDateTime fileCreationTime,
+                                                           LocalDateTime writeTime,
+                                                           int firstCluster,
+                                                           long fileSize) {
+        return new DirectoryItemEntry(name, attributes, fileCreationTime, writeTime, firstCluster, fileSize);
+    }
+
+    private DirectoryItemEntry(
             String name,
             Attributes attributes,
             LocalDateTime fileCreationTime,
@@ -145,7 +153,11 @@ public class DirectoryItemEntry {
         this(name, attributes, fileCreationTime, writeTime, null, firstCluster, fileSize);
     }
 
-    public DirectoryItemEntry(
+    public boolean isPersisted() {
+        return this.entryCluster != -1 && this.entryOffset != -1;
+    }
+
+    private DirectoryItemEntry(
             String name,
             Attributes attributes,
             LocalDateTime fileCreationTime,
@@ -154,24 +166,28 @@ public class DirectoryItemEntry {
             int firstCluster,
             long fileSize
     ) {
-        String[] parts = name.split("\\.");
-        if(parts.length == 2) {
-            if(parts[0].length() > 8) {
-                throw new IllegalArgumentException("file name should not exceed 8 characters");
-            }
+        if(!name.equals(DirectoryBase.CURRENT_DIRECTORY_NAME) && !name.equals(DirectoryBase.PARENT_DIRECTORY_NAME)) {
+            String[] parts = name.split("\\.");
+            if (parts.length == 2) {
+                if (parts[0].length() > 8) {
+                    throw new IllegalArgumentException("file name should not exceed 8 characters");
+                }
 
-            if(parts[1].length() > 3) {
-                throw new IllegalArgumentException("file extension should not exceed 3 characters");
-            }
+                if (parts[1].length() > 3) {
+                    throw new IllegalArgumentException("file extension should not exceed 3 characters");
+                }
 
-            shortFileName = ByteUtils.shortName(parts[0].toUpperCase(), parts[1].toUpperCase());
-        } else if(parts.length == 1){
-            if(parts[0].length() > 8) {
-                throw new IllegalArgumentException("file name should not exceed 8 characters");
+                shortFileName = ByteUtils.shortName(parts[0].toUpperCase(), parts[1].toUpperCase());
+            } else if (parts.length == 1) {
+                if (parts[0].length() > 8) {
+                    throw new IllegalArgumentException("file name should not exceed 8 characters");
+                }
+                shortFileName = ByteUtils.shortName(parts[0].toUpperCase());
+            } else {
+                throw new IllegalArgumentException(String.format("%s is not a valid file name", name));
             }
-            shortFileName = ByteUtils.shortName(parts[0].toUpperCase());
         } else {
-            throw new IllegalArgumentException(String.format("%s is not a valid file name", name));
+            shortFileName = ByteUtils.shortName(name);
         }
 
         this.attributes = attributes;
@@ -185,9 +201,15 @@ public class DirectoryItemEntry {
         this.fileLastAccessDate = FileDateTime.toInteger(lastAccessed);
         this.firstCluster = firstCluster;
         this.fileSize = fileSize;
+        this.entryCluster = -1;
+        this.entryOffset = -1;
     }
 
-    public DirectoryItemEntry(byte[] bytes, int offset) {
+    private DirectoryItemEntry(byte[] bytes, int clusterNumber, int entryOffset) {
+        this(bytes, 0, clusterNumber, entryOffset);
+    }
+
+    private DirectoryItemEntry(byte[] bytes, int offset, int clusterNumber, int entryOffset) {
         this.shortFileName = Arrays.copyOfRange(bytes, offset, offset + BYTES_PER_SHORT_NAME);
         this.attributes = Attributes.fromByte(bytes[offset + ATTRIBUTES_OFFSET]);
         this.fileCreationTenths = bytes[offset + CREATION_TIME_TENTHS_OFFSET];
@@ -200,6 +222,8 @@ public class DirectoryItemEntry {
         this.writeTime = (int) ByteUtils.parseLong(bytes, offset + WRITE_TIME_OFFSET, 2);
         this.writeDate = (int) ByteUtils.parseLong(bytes, offset + WRITE_DATE_OFFSET, 2);
         this.fileSize = ByteUtils.parseLong(bytes, offset + FILE_SIZE_OFFSET, 4);
+        this.entryCluster = clusterNumber;
+        this.entryOffset = entryOffset;
     }
 
     public void writeDirectoryEntry(byte[] target) {
@@ -219,15 +243,23 @@ public class DirectoryItemEntry {
         ByteUtils.writeDWord(target, fileSize, FILE_SIZE_OFFSET);
     }
 
-    public static List<DirectoryItemEntry> getDirectoryEntries(byte[] bytes, int offset) {
-        List<DirectoryItemEntry> entries = new ArrayList<>(bytes.length / BYTES_PER_DIRECTORY_ENTRY);
-        for(int i = 0; i < bytes.length; i+= BYTES_PER_DIRECTORY_ENTRY) {
-            //TODO is this sufficient to terminate a directory listing operation?
-            if(bytes[offset + i] == 0) {
-                break;
+    public static Stream<DirectoryItemEntry> fromBuffer(ByteBuffer buffer, int clusterNumber) {
+        byte[] rawEntry = new byte[BYTES_PER_DIRECTORY_ENTRY];
+        int limit = buffer.limit() / BYTES_PER_DIRECTORY_ENTRY;
+        buffer.position(0);
+        return Stream.generate(() -> {
+            int entryOffset = buffer.position();
+            buffer.get(rawEntry);
+            if(rawEntry[0] != 0) {
+                return new DirectoryItemEntry(rawEntry, clusterNumber, entryOffset);
+            } else {
+                return null;
             }
-            entries.add(new DirectoryItemEntry(bytes, offset + i));
-        }
-        return entries;
+        }).limit(limit).filter(Objects::nonNull);
+    }
+
+    //TODO how do we match entries?
+    public boolean matches(DirectoryItemEntry other) {
+        return other.firstCluster == this.firstCluster;
     }
 }

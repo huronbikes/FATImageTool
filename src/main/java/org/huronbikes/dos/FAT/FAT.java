@@ -16,4 +16,5 @@ public interface FAT {
     List<Integer> allocate(long fileSize);
     void store(List<Integer> cluster);
     void commit() throws IOException;
+    void free(List<Integer> cluster);
 }

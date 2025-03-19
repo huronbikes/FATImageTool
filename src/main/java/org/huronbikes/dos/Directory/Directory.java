@@ -2,9 +2,10 @@ package org.huronbikes.dos.Directory;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.stream.Stream;
 
 public interface Directory {
-    List<DirectoryItemEntry> getDirectoryEntries() throws IOException;
+    Stream<DirectoryItemEntry> getDirectoryEntries() throws IOException;
 
     List<DirectoryItemEntry> list() throws IOException;
 
